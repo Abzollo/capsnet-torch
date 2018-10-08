@@ -4,9 +4,9 @@ RANDOM_SEED = 10
 EPSILON = 1e-6
 
 # Training-specific hyperparameters
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
-CHECKPOINT = 200
+CHECKPOINT = 20
 EPOCHS = 3
 MOMENTUM = 0.9
 
