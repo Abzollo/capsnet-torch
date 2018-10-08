@@ -5,6 +5,14 @@ from torch.autograd import Variable
 
 from training_configs import *
 
+# XXX
+def printgrad(x, gin, gout):
+    print(x)
+    print('tensor: ', gin)
+    print('grad: ', gout)
+    print('')
+
+
 def spread_loss(activations, target_index, m):
     """
     Spread loss penalizes activations closer to the margin
@@ -13,7 +21,6 @@ def spread_loss(activations, target_index, m):
     """
 
     # Get the activation of the target class (a scalar)
-    activations = activations[:,0,0,:]  # TODO: delete me
     target_index = target_index.unsqueeze(dim=1)
     target_activation = activations.gather(-1, target_index)
     # Calculate loss per class activation
@@ -21,7 +28,7 @@ def spread_loss(activations, target_index, m):
     # Don't sum over target's activation
     loss_i.scatter_(-1, target_index, 0)
 
-    return torch.sum(loss_i)
+    return loss_i.sum(dim=-1).mean()
 
 
 ### Define model ###
@@ -29,102 +36,136 @@ class CapsNet(nn.Module):
     def __init__(self):
         super(CapsNet, self).__init__()
         self.conv1 = nn.Conv2d(1, A, 5, stride=2, padding=2)
-        self.primary_caps = self.init_primary_caps_layer(A, B)
-        self.caps_conv1 = CapsLayer(B, C)
-        self.caps_conv2 = CapsLayer(C, D)
-        self.caps_class = CapsLayer(D, E)
-
-
-    def init_primary_caps_layer(self, in_caps, out_caps):
-        # Convolution followed by view for capsules
-        out_channels = B * (POSE_DIM * POSE_DIM + 1)
-        conv = nn.Conv2d(A, out_channels, 1, stride=1)
-
-        def conv_to_caps_view(x):
-            kernel_size = x.size()[-1]
-            activations, pose = x[:, :B, ...], x[:, B:, ...]
-            activations = activations.view(BATCH_SIZE,
-                kernel_size, kernel_size, B)
-            pose = pose.view(BATCH_SIZE,
-                kernel_size, kernel_size, B, POSE_DIM, POSE_DIM)
-            return pose, activations
-
-        return lambda x: conv_to_caps_view(conv(x))
+        self.primary_caps = PrimaryCaps(A, B)
+        self.caps_conv1 = ConvCaps(B, C, stride=2)
+        self.caps_conv2 = ConvCaps(C, D, stride=1)
+        self.caps_class = ConvCaps(D, E, kernel_size=4)
+        #self.caps_class.activations_conv.register_backward_hook(printgrad) XXX
 
 
     def forward(self, x):
-
         # First layer
         x = F.relu(self.conv1(x))
-
         # Primary caps layer
-        print("primary_caps...")
         pose, activations = self.primary_caps(x)
-
         # ConvCaps1 layer
-        print("caps_conv1...")
         pose, activations = self.caps_conv1(pose, activations)
-
         # ConvCaps2 layer
-        print("caps_conv2...")
         pose, activations = self.caps_conv2(pose, activations)
-
         # Caps Classes layer
-        print("caps_class...")
         pose, activations = self.caps_class(pose, activations)
 
-        return activations
+        return activations.squeeze()
 
 
-class CapsLayer(nn.Module):
-    def __init__(self, num_caps_in, num_caps_out):
-        super(CapsLayer, self).__init__()
-        self.transformation = Variable(
-            torch.randn(1, 1, 1, num_caps_in, num_caps_out, POSE_DIM, POSE_DIM))
-        self.router = CapsulesRouter(num_caps_in, num_caps_out)
+    def get_params(self):
+        """
+        TODO
+        """
+        return list(self.conv1.parameters()) +\
+            list(self.primary_caps.parameters()) +\
+            list(self.caps_conv1.parameters()) +\
+            list(self.caps_conv2.parameters()) +\
+            list(self.caps_class.parameters())
+
+
+class PrimaryCaps(nn.Module):
+    def __init__(self, num_caps_in, num_caps_out, kernel_size=1, stride=1):
+        """
+        The primary caps layer.
+        """
+        super(PrimaryCaps, self).__init__()
+        self.num_caps_in = num_caps_in
+        self.num_caps_out = num_caps_out
+
+        out_channels = num_caps_out * (POSE_DIM * POSE_DIM + 1)
+        self.conv = nn.Conv2d(num_caps_in, out_channels, kernel_size, stride)
+
+
+    def forward(self, x):
+        """
+        x: (BATCH_SIZE, channels, filter_size, filter_size)
+        """
+
+        # Convolution layer, followed by seperation of pose and activations
+        x = self.conv(x)
+
+        # Kernel size after convolution (check last dims)
+        filter_size = x.size()[-1]
+        
+        # Seperate activations and pose
+        activations = x[:, :self.num_caps_out, ...]
+        pose        = x[:, self.num_caps_out:, ...]
+
+        # The following views should work
+        activations = activations.view(BATCH_SIZE,
+            filter_size, filter_size, self.num_caps_out)
+        pose = pose.view(BATCH_SIZE,
+            filter_size, filter_size, self.num_caps_out, POSE_DIM, POSE_DIM)
+        
+        return pose, torch.sigmoid(activations)
+
+
+class ConvCaps(nn.Module):
+    def __init__(self, num_caps_in, num_caps_out, kernel_size=K, stride=1):
+        """
+        A capsule convolutional layer.
+        """
+        super(ConvCaps, self).__init__()
+        self.num_caps_in = num_caps_in
+        self.num_caps_out = num_caps_out
+
+        # The weight matrices that transform the poses into votes
+        self.transformation_conv = nn.Conv2d(
+            num_caps_in * POSE_DIM * POSE_DIM,
+            num_caps_out * POSE_DIM * POSE_DIM,
+            kernel_size=kernel_size, stride=stride, groups=POSE_DIM * POSE_DIM)
+        # ??? XXX
+        self.activations_conv = nn.Conv2d(num_caps_in, num_caps_in,
+            kernel_size=kernel_size, stride=stride)
+
+        # Routing probability for capsule i to route to capsule j
+        self.routing_prob = torch.zeros(1, 1, 1, num_caps_in, num_caps_out)
+
+        # Increment me after each routing iteration (inverse temperature)
+        self.inv_temp = torch.ones(1)
+
+        # Learned parameters (you can call them "benefits", so to speak)
+        self.beta_v = nn.Parameter(torch.randn(1, 1, 1, num_caps_out, POSE_DIM * POSE_DIM))
+        self.beta_a = nn.Parameter(torch.randn(1, 1, 1, num_caps_out))
 
 
     def forward(self, pose_in, activations_in):
         """
         Takes the state of a capsule layer, outputs the state of the next
         capsule layer, where state means: pose + activations.
+
+        First, we tranform the pose to votes by the transformation weight.
+        Then, we get the votes and activations and last capsule layer, and
+        output the pose and activations of the next capsule layer.
         """
 
-        # Apply transformation with ReLU (-3 is j, the out dim)
-        votes = F.relu(pose_in.unsqueeze(dim=-3) @ self.transformation)
-        # Apply EM-routing
-        pose_out, activations_out = self.router(votes, activations_in)
+        def caps_conv(x, conv):
+            # View
+            x = x.view(*x.size()[:3], -1)
+            x = x.permute([0, 3, 1, 2])
+            # Transformation
+            x = conv(x)
+            # View
+            x = x.permute([0, 2, 3, 1])
 
-        return pose_out, activations_out
+            return x
 
+        # Pose
+        votes = caps_conv(pose_in, self.transformation_conv)
+        votes = votes.view(*votes.size()[:-1],
+            1, -1, POSE_DIM * POSE_DIM)
 
-class CapsulesRouter(nn.Module):
-    def __init__(self, num_caps_in, num_caps_out):
-        super(CapsulesRouter, self).__init__()
-        self.num_caps_in = num_caps_in
-        self.num_caps_out = num_caps_out
+        # Activations
+        activations_in = caps_conv(activations_in, self.activations_conv)
+        activations_in = activations_in.view(
+            *activations_in.size()[:-1], -1)
 
-        # Routing probability for capsule i to route to capsule j
-        # TODO: do this for each forward()?
-        self.routing_prob = torch.zeros(1, 1, 1, num_caps_in, num_caps_out)
-        self.routing_prob = self.routing_prob + 1 / num_caps_out
-
-        # Increment me after each routing iteration (inverse temperature)
-        self.inv_temp = torch.ones(1)
-
-        # Learned parameters (you can call them "benefits", so to speak)
-        self.beta_v = Variable(torch.randn(1, 1, 1, num_caps_out, POSE_DIM * POSE_DIM))
-        self.beta_a = Variable(torch.randn(1, 1, 1, num_caps_out))
-
-
-    def forward(self, votes, activations_in):
-        """
-        Get the votes (in matrix form) and activations and last capsule layer.
-        Outputs the pose (in matrix form) and activations of the next capsule layer.
-        """
-
-        # Vectorize the votes_ij matrices (only the POSE_DIM x POSE_DIM part)
-        votes = votes.view(*votes.size()[:-2], POSE_DIM * POSE_DIM)
         # Get the result from EM-routing, skip the variances
         pose_means, _, activations_out = self.EM_routing(votes, activations_in)
         # Pack pose means back into the matrix form
@@ -134,6 +175,10 @@ class CapsulesRouter(nn.Module):
 
 
     def EM_routing(self, votes, activations_in):
+        # Reset TODO: ?
+        self.routing_prob = torch.zeros(1, 1, 1, self.num_caps_in, self.num_caps_out)
+        self.routing_prob += 1 / self.num_caps_out
+
         # Perform EM-routing for ROUTING_ITER iterations
         for _ in range(ROUTING_ITER):
             output_params = self.M_step(votes, activations_in)
@@ -157,6 +202,7 @@ class CapsulesRouter(nn.Module):
         # Update routing probabilities according to the prev caps activations
         # (notice here -1 dim is the out dim)
         self.routing_prob = self.routing_prob * activations_in.unsqueeze(dim=-1)
+        self.routing_prob = self.routing_prob.detach()
         # Add a pose dimension (-1 dim is h, the pose dim)
         routing_prob = self.routing_prob.unsqueeze(dim=-1)
 
@@ -191,17 +237,20 @@ class CapsulesRouter(nn.Module):
 
         # Calculate probabilities of votes agreement with output caps
         # (dim -3 is unsqueezed to get i, then we sum over h = dim -1)
+
+        # XXX something is blowing up the gradients here
         pose_means = pose_means.unsqueeze(dim=-3)
         pose_variances = pose_variances.unsqueeze(dim=-3)
         votes_variances = torch.pow(votes - pose_means, 2)
-        exponent = -torch.sum(votes_variances / (2 * pose_variances), dim=-1)
-        coeff_inv = torch.sqrt(torch.prod(2 * PI * pose_variances, dim=-1))
+        exponent = -torch.sum(votes_variances / (EPSILON + 2 * pose_variances), dim=-1)
+        coeff_inv = torch.sqrt(EPSILON + torch.prod(2 * PI * pose_variances, dim=-1))
         agreement_prob = torch.exp(exponent) / coeff_inv
 
         # Update routing probabilities
         activations_out = activations_out.unsqueeze(dim=-2)  # Add 'i' dim
         self.routing_prob = (EPSILON + activations_out * agreement_prob) / \
             torch.sum(EPSILON + activations_out * agreement_prob, dim=-2, keepdim=True)
+        self.routing_prob = self.routing_prob.detach()
 
 
 
