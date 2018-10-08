@@ -4,13 +4,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
 import torchvision
 import torchvision.transforms as transforms
-from torch.autograd import Variable
-import torch.nn.functional as F
 
 from training_configs import *
-from capsnet import CapsNet, CapsLayer, spread_loss
+from capsnet import CapsNet, spread_loss
 
 # Set random seed if given
 torch.manual_seed(RANDOM_SEED or torch.initial_seed())
@@ -34,26 +35,19 @@ def imshow(img):
     img = img / 2 + 0.5     # unnormalize
     npimg = img.numpy()
     plt.imshow(np.transpose(npimg, (1, 2, 0)))
-"""
-dataiter = iter(trainloader)
-images, labels = dataiter.next()
-imshow(torchvision.utils.make_grid(images))
-plt.show()
-"""
+
 
 # Initialize capsnet
 capsnet = CapsNet()
 # Initialize optimizer and loss function
-optimizer = torch.optim.SGD(capsnet.parameters(),
-    lr=LEARNING_RATE, momentum=MOMENTUM)
-# Adam seems to be faster (maybe)
-optimizer = torch.optim.Adam(capsnet.parameters())
+optimizer = torch.optim.Adam(capsnet.get_params())
 # Using spread loss for capsnet
-loss_function = spread_loss
+# loss_function = lambda x, y: spread_loss(x, y, 1)
+loss_function = nn.CrossEntropyLoss()
 loss_margin = 0.2
 
 # Start training
-start = time.time(); print('Training...')
+start_time = time.time(); print('Training...')
 for epoch in range(EPOCHS):
     running_loss = 0.0
     for i, data in enumerate(trainloader):
@@ -66,7 +60,7 @@ for epoch in range(EPOCHS):
 
         # Do a forward pass, compute loss, then do a backward pass
         activations = capsnet(images)
-        loss = loss_function(activations, labels, loss_margin)
+        loss = loss_function(activations, labels)
         loss.backward()
 
         # Update parameters using the optimizer
